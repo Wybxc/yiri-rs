@@ -1,148 +1,122 @@
+use chocho::prelude::*;
+
 use async_trait::async_trait;
-use ricq::{
+use chocho::ricq::{
     client::event::{FriendMessageEvent, GroupMessageEvent, NewFriendRequestEvent},
-    handler::{Handler, QEvent},
-    msg::{elem::RQElem, MessageChainBuilder},
+    handler::PartlyHandler,
 };
+use chocho_msg::msg;
 
 pub struct YiriHandler {
-    pub uin: i64,
     pub talk_server: String,
 }
 
+impl YiriHandler {
+    pub fn new() -> Self {
+        let talk_server =
+            std::env::var("YIRI_TALK_SERVER").unwrap_or("http://localhost:6000".to_string());
+        Self { talk_server }
+    }
+}
+
 #[async_trait]
-impl Handler for YiriHandler {
-    async fn handle(&self, event: QEvent) {
-        tracing::debug!("收到事件：{:?}", event);
+impl PartlyHandler for YiriHandler {
+    async fn handle_group_message(&self, GroupMessageEvent { client, inner }: GroupMessageEvent) {
+        tracing::debug!("收到事件：{:?}", inner);
 
-        match event {
-            QEvent::GroupMessage(GroupMessageEvent { client, inner }) => {
-                let mut reply = rand::random::<f64>() > 0.96;
-                let mut at_me = false;
+        let uin = client.uin().await;
+        let group_name = inner.group_name;
+        let group_code = inner.group_code;
 
-                let quote = inner.elements.reply();
+        let mut reply = rand::random::<f64>() > 0.96;
+        let mut at_me = false;
 
-                let message = inner
-                    .elements
-                    .into_iter()
-                    .filter_map(|e| {
-                        if let RQElem::At(ref at) = e {
-                            if at.target == self.uin {
-                                reply = true;
-                                at_me = true;
-                            }
-                        }
-                        if let RQElem::Text(t) = e {
-                            Some(t.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<String>>();
-                let message = message.join("").trim().to_string();
-
-                tracing::info!(
-                    "Group {}[{}] -> {}",
-                    inner.group_name,
-                    inner.group_code,
-                    message
-                );
-
-                if !reply {
-                    return;
-                }
-
-                if message.is_empty() && at_me {
-                    let mut builder = MessageChainBuilder::new();
-                    builder.push_str("你在叫我吗？");
-                    let mut response = builder.build();
-
-                    if let Some(reply) = quote {
-                        response.with_reply(reply);
-                    }
-
-                    if let Err(e) = client.send_group_message(inner.group_code, response).await {
-                        tracing::error!("发送消息失败：{}", e);
-                    }
-                    return;
-                }
-
-                let response = match crate::talk::get_reponse(&self.talk_server, &message).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::error!("获取回复失败：{}", e);
-                        return;
-                    }
-                };
-
-                tracing::info!(
-                    "Group {}[{}] <- {}",
-                    inner.group_name,
-                    inner.group_code,
-                    response
-                );
-
-                let mut builder = MessageChainBuilder::new();
-                builder.push_str(&response);
-                let response = builder.build();
-
-                if let Err(e) = client.send_group_message(inner.group_code, response).await {
-                    tracing::error!("发送消息失败：{}", e);
-                }
+        let message: Message = inner.elements.into();
+        let mut request = String::new();
+        for elem in message.into_elems() {
+            if let RQElem::At(ref at) = elem && at.target == uin {
+                reply = true;
+                at_me = true;
             }
-            QEvent::FriendMessage(FriendMessageEvent { client, inner }) => {
-                let message = inner
-                    .elements
-                    .into_iter()
-                    .filter_map(|e| {
-                        if let RQElem::Text(t) = e {
-                            Some(t.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<String>>();
-                let message = message.join("");
-
-                tracing::info!(
-                    "Friend {}[{}] <- {}",
-                    inner.from_nick,
-                    inner.from_uin,
-                    message
-                );
-
-                let response = match crate::talk::get_reponse(&self.talk_server, &message).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::error!("获取回复失败：{}", e);
-                        return;
-                    }
-                };
-
-                tracing::info!(
-                    "Friend {}[{}] <- {}",
-                    inner.from_nick,
-                    inner.from_uin,
-                    response
-                );
-
-                let mut builder = MessageChainBuilder::new();
-                builder.push_str(&response);
-                let response = builder.build();
-
-                if let Err(e) = client.send_friend_message(inner.from_uin, response).await {
-                    tracing::error!("发送消息失败：{}", e);
-                }
+            if let RQElem::Text(t) = elem {
+                request.push_str(&t.content)
             }
-            QEvent::NewFriendRequest(NewFriendRequestEvent { client, inner }) => {
-                if let Err(e) = client
-                    .solve_friend_system_message(inner.msg_seq, inner.req_uin, true)
-                    .await
-                {
-                    tracing::error!("处理好友请求失败：{}", e);
-                }
+        }
+        let request = request.trim().to_string();
+
+        tracing::info!("Group {}[{}] -> {}", group_name, group_code, request);
+
+        if !reply {
+            return;
+        }
+
+        if request.is_empty() && at_me {
+            if let Err(e) = client.group(group_code).send(msg!["你在叫我吗？"]).await {
+                tracing::error!("发送消息失败：{}", e);
             }
-            _ => {}
+            return;
+        }
+
+        let response = match crate::talk::get_reponse(&self.talk_server, &request).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("获取回复失败：{}", e);
+                return;
+            }
+        };
+
+        tracing::info!("Group {}[{}] <- {}", group_name, group_code, response);
+
+        if let Err(e) = client.group(group_code).send(response).await {
+            tracing::error!("发送消息失败：{}", e);
+        }
+    }
+
+    async fn handle_friend_message(
+        &self,
+        FriendMessageEvent { client, inner }: FriendMessageEvent,
+    ) {
+        tracing::debug!("收到事件：{:?}", inner);
+
+        let from_nick = inner.from_nick;
+        let from_uin = inner.from_uin;
+
+        let message: Message = inner.elements.into();
+        let mut request = String::new();
+        for elem in message.into_elems() {
+            if let RQElem::Text(t) = elem {
+                request.push_str(&t.content);
+            }
+        }
+
+        tracing::info!("Friend {}[{}] <- {}", from_nick, from_uin, request);
+
+        let response = match crate::talk::get_reponse(&self.talk_server, &request).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("获取回复失败：{}", e);
+                return;
+            }
+        };
+
+        tracing::info!("Friend {}[{}] <- {}", from_nick, from_uin, response);
+
+        if let Err(e) = client.friend(from_uin).send(response).await {
+            tracing::error!("发送消息失败：{}", e);
+        }
+    }
+
+    async fn handle_friend_request(
+        &self,
+        NewFriendRequestEvent { client, inner }: NewFriendRequestEvent,
+    ) {
+        tracing::debug!("收到事件：{:?}", inner);
+
+        if let Err(e) = client
+            .solve_friend_system_message(inner.msg_seq, inner.req_uin, true)
+            .await
+        {
+            tracing::error!("处理好友请求失败：{}", e);
         }
     }
 }
